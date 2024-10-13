@@ -63,7 +63,9 @@ pub async fn post(
                             Some(e.fingerprint.clone())
                         };
 
-                         Fighters::update(fighters::ActiveModel {
+                        // TODO: tx
+
+                        Fighters::update(fighters::ActiveModel {
                             rank: ActiveValue::set(my_r),
                             queued: ActiveValue::set(false),
                             ..Default::default()

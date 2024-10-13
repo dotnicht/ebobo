@@ -12,7 +12,7 @@ pub async fn Fighters() -> View {
     let available = create_signal(fighters);
 
     if size == 0 {
-        view!(p { "no fighters available" })
+        view!(p { "empty here" })
     } else {
         view!( div {
             p { "choose your fighter:" }
