@@ -2,8 +2,7 @@ name: deploy server to shuttle
 
 on:
   push:
-    branches:
-      - "ebobo"
+    branches: ["🐱"]
     paths:
       - "server/**"
       - "shared/**"
