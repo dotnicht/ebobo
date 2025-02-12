@@ -23,6 +23,3 @@ pub struct Fighter(pub String);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Choice(pub String);
-
-#[derive(Debug)]
-pub struct Adolf();
