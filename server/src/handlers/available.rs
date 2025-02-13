@@ -4,7 +4,7 @@ use sea_orm::*;
 use ebobo_shared::Fighter;
 
 use crate::{
-    entities::{prelude::*, fighters},
+    entities::{fighters, prelude::*},
     EboboState,
 };
 
@@ -12,10 +12,8 @@ use crate::{
 pub async fn options() {}
 
 #[get("/available")]
-pub async fn get(
-    state: &State<EboboState>,
-) -> Result<Json<Vec<Fighter>>, BadRequest<String>> {
-    let fighters = ['🐱', '🐵', '🐶', '🐷', '🐰', '🐮'];
+pub async fn get(state: &State<EboboState>) -> Result<Json<Vec<Fighter>>, BadRequest<String>> {
+    let fighters = ['🐱', '🐵', '🐶', '🐷', '🐰', '🐮', '🐻'];
 
     let taken = Fighters::find()
         .column(fighters::Column::Emo)
