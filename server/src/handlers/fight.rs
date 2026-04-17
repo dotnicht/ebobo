@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
-use rocket::{futures::*, State};
+use futures::SinkExt;
+use rocket::State;
 use sea_orm::{prelude::*, *};
 use ebobo_shared::Utc;
 
@@ -17,124 +19,113 @@ pub async fn post(
     ws: rocket_ws::WebSocket,
     state: &State<EboboState>,
 ) -> rocket_ws::Channel<'static> {
-    // Pure function to update queued status for a fighter
-    let update_queue = |db: &DatabaseConnection, fingerprint: &str| async move {
-        Fighters::update(fighters::ActiveModel {
-            queued: ActiveValue::set(true),
-            ..Default::default()
-        })
-        .filter(fighters::Column::Fingerprint.eq(fingerprint.to_string()))
-        .exec(db)
-        .await
-    };
-
-    // Pure function to find an opponent in the queue
-    let find_opponent = |db: &DatabaseConnection, fingerprint: &str| async move {
-        Fighters::find()
-            .filter(
-                fighters::Column::Fingerprint
-                    .ne(fingerprint.to_string())
-                    .and(fighters::Column::Queued.eq(true)),
-            )
-            .limit(1)
-            .all(db)
-            .await
-    };
-
-    // Pure function to calculate match results
-    let match_outcome = |enemy_rank: i32, my_rank: i32, enemy_fp: String, my_fp: String| {
-        let (mut enemy_r, mut my_r) = (enemy_rank + 1, my_rank + 1);
-        let winner = if enemy_rank == my_rank {
-            enemy_r += 1;
-            my_r += 1;
-            None
-        } else if enemy_rank < my_rank {
-            my_r += 2;
-            Some(my_fp)
-        } else {
-            enemy_r += 2;
-            Some(enemy_fp)
-        };
-        (enemy_r, my_r, winner)
-    };
-
-    // Pure function to update ranks and queue status
-    let update_fighter = |db: &DatabaseConnection, fingerprint: &str, rank: i32| async move {
-        Fighters::update(fighters::ActiveModel {
-            rank: ActiveValue::set(rank),
-            queued: ActiveValue::set(false),
-            ..Default::default()
-        })
-        .filter(fighters::Column::Fingerprint.eq(fingerprint.to_string()))
-        .exec(db)
-        .await
-    };
-
-    // Pure function to create match and plays
-    let create_match_and_plays = |db: &DatabaseConnection, winner: Option<String>, my_fp: String, enemy_fp: String| async move {
-        let id = Uuid::new_v4();
-        Matches::insert(matches::ActiveModel {
-            id: ActiveValue::set(id),
-            winner: ActiveValue::set(winner.clone()),
-            date: ActiveValue::set(Utc::now().naive_utc()),
-        });
-        let play_futures = vec![
-            Plays::insert(plays::ActiveModel {
-                r#match: ActiveValue::set(id),
-                fighter: ActiveValue::set(my_fp.clone()),
-                ..Default::default()
-            })
-            .exec(db),
-            Plays::insert(plays::ActiveModel {
-                r#match: ActiveValue::set(id),
-                fighter: ActiveValue::set(enemy_fp.clone()),
-                ..Default::default()
-            })
-            .exec(db),
-        ];
-        futures::future::join_all(play_futures).await;
-        winner
-    };
-
     let db = state.db.clone();
     let fingerprint = auth.fingerprint.clone();
 
-    // All side-effects happen in the async closure for the websocket channel
     ws.channel(move |mut stream| {
         let db = db.clone();
         let fingerprint = fingerprint.clone();
         let auth = auth.clone();
         Box::pin(async move {
-            update_queue(&db, &fingerprint).await.unwrap();
+            // Mark this fighter as queued
+            Fighters::update(fighters::ActiveModel {
+                queued: ActiveValue::set(true),
+                ..Default::default()
+            })
+            .filter(fighters::Column::Fingerprint.eq(fingerprint.clone()))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
 
-            let try_match = || async {
-                let queue_result = find_opponent(&db, &fingerprint).await;
-                queue_result.ok().and_then(|queue| queue.first().cloned())
-            };
+            // Try to find an opponent
+            let opponents = Fighters::find()
+                .filter(
+                    fighters::Column::Fingerprint
+                        .ne(fingerprint.clone())
+                        .and(fighters::Column::Queued.eq(true)),
+                )
+                .limit(1)
+                .all(db.as_ref())
+                .await
+                .unwrap_or_default();
 
-            while let Some(enemy) = try_match().await {
+            if let Some(enemy) = opponents.into_iter().next() {
                 let fighter = auth.fighter.clone().unwrap();
 
-                let (enemy_r, my_r, winner) = match_outcome(enemy.rank, fighter.rank, enemy.fingerprint.clone(), fingerprint.clone());
+                let (mut enemy_r, mut my_r) = (enemy.rank + 1, fighter.rank + 1);
+                let winner = if enemy.rank == fighter.rank {
+                    enemy_r += 1;
+                    my_r += 1;
+                    None
+                } else if enemy.rank < fighter.rank {
+                    my_r += 2;
+                    Some(fingerprint.clone())
+                } else {
+                    enemy_r += 2;
+                    Some(enemy.fingerprint.clone())
+                };
 
-                let (update_my, update_enemy) = futures::join!(
-                    update_fighter(&db, &fingerprint, my_r),
-                    update_fighter(&db, &enemy.fingerprint, enemy_r)
+                // Update both fighters' ranks and clear queue status
+                let my_fp = fingerprint.clone();
+                let enemy_fp = enemy.fingerprint.clone();
+                let db1 = Arc::clone(&db);
+                let db2 = Arc::clone(&db);
+                let (r1, r2) = futures::join!(
+                    Fighters::update(fighters::ActiveModel {
+                        rank: ActiveValue::set(my_r),
+                        queued: ActiveValue::set(false),
+                        ..Default::default()
+                    })
+                    .filter(fighters::Column::Fingerprint.eq(my_fp))
+                    .exec(db1.as_ref()),
+                    Fighters::update(fighters::ActiveModel {
+                        rank: ActiveValue::set(enemy_r),
+                        queued: ActiveValue::set(false),
+                        ..Default::default()
+                    })
+                    .filter(fighters::Column::Fingerprint.eq(enemy_fp.clone()))
+                    .exec(db2.as_ref())
                 );
-                update_my.unwrap();
-                update_enemy.unwrap();
+                r1.unwrap();
+                r2.unwrap();
 
-                let winner_fp = create_match_and_plays(&db, winner.clone(), fingerprint.clone(), enemy.fingerprint.clone()).await;
+                // Record the match
+                let match_id = Uuid::new_v4();
+                Matches::insert(matches::ActiveModel {
+                    id: ActiveValue::set(match_id),
+                    winner: ActiveValue::set(winner.clone()),
+                    date: ActiveValue::set(Utc::now().naive_utc()),
+                })
+                .exec(db.as_ref())
+                .await
+                .unwrap();
 
-                if let Some(winner_fp) = winner_fp {
+                let db3 = Arc::clone(&db);
+                let db4 = Arc::clone(&db);
+                let my_fp2 = fingerprint.clone();
+                let (p1, p2) = futures::join!(
+                    Plays::insert(plays::ActiveModel {
+                        r#match: ActiveValue::set(match_id),
+                        fighter: ActiveValue::set(my_fp2),
+                        ..Default::default()
+                    })
+                    .exec(db3.as_ref()),
+                    Plays::insert(plays::ActiveModel {
+                        r#match: ActiveValue::set(match_id),
+                        fighter: ActiveValue::set(enemy_fp),
+                        ..Default::default()
+                    })
+                    .exec(db4.as_ref())
+                );
+                p1.ok();
+                p2.ok();
+
+                if let Some(winner_fp) = winner {
                     let _ = stream.send(rocket_ws::Message::Text(winner_fp)).await;
                 }
-
-                break;
+            } else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-
-            // Sleep at the end of each loop if no match was found
-            tokio::time::sleep(Duration::from_secs(5)).await;
 
             Ok(())
         })
